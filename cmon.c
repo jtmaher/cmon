@@ -449,6 +449,14 @@ static void parse_stats_cache(CmonState *st) {
     free(buf);
     if (!root) return;
 
+    /* Compute cutoff date string (30 days ago) for filtering */
+    char cutoff_date[16];
+    {
+        time_t cutoff = time(NULL) - 30 * 24 * 60 * 60;
+        struct tm *ct = localtime(&cutoff);
+        strftime(cutoff_date, sizeof(cutoff_date), "%Y-%m-%d", ct);
+    }
+
     /* dailyActivity */
     st->daily_count = 0;
     cJSON *da = cJSON_GetObjectItem(root, "dailyActivity");
@@ -456,11 +464,12 @@ static void parse_stats_cache(CmonState *st) {
         cJSON *item;
         cJSON_ArrayForEach(item, da) {
             if (st->daily_count >= MAX_DAILY) break;
+            cJSON *d = cJSON_GetObjectItem(item, "date");
+            if (!cJSON_IsString(d)) continue;
+            if (strcmp(d->valuestring, cutoff_date) < 0) continue;
             DailyStats *ds = &st->daily[st->daily_count];
             memset(ds, 0, sizeof(*ds));
-            cJSON *d = cJSON_GetObjectItem(item, "date");
-            if (cJSON_IsString(d))
-                strncpy(ds->date, d->valuestring, sizeof(ds->date) - 1);
+            strncpy(ds->date, d->valuestring, sizeof(ds->date) - 1);
             cJSON *mc = cJSON_GetObjectItem(item, "messageCount");
             if (cJSON_IsNumber(mc)) ds->message_count = (int)mc->valuedouble;
             cJSON *sc = cJSON_GetObjectItem(item, "sessionCount");
