@@ -1087,6 +1087,7 @@ static int draw_daily_history(CmonState *st, int row, int rows, int cols) {
     /* Show daily stats in reverse chronological order */
     int avail_rows = rows - row - 8; /* leave room for alltime + status */
     if (avail_rows < 3) avail_rows = 3;
+    if (avail_rows > 10) avail_rows = 10;
 
     st->max_scroll = st->daily_count - avail_rows;
     if (st->max_scroll < 0) st->max_scroll = 0;
