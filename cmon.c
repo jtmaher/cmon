@@ -775,6 +775,8 @@ static void scan_historical_sessions(CmonState *st) {
         memset(st->daily[i].models, 0, sizeof(st->daily[i].models));
     }
 
+    time_t cutoff = time(NULL) - 30 * 24 * 60 * 60; /* 30 days ago */
+
     char projects_dir[MAX_PATH_LEN];
     snprintf(projects_dir, sizeof(projects_dir), "%s/projects", st->claude_dir);
 
@@ -820,6 +822,8 @@ static void scan_historical_sessions(CmonState *st) {
             } else if (S_ISREG(sb.st_mode)) {
                 size_t nlen = strlen(ent->d_name);
                 if (nlen > 6 && strcmp(ent->d_name + nlen - 6, ".jsonl") == 0) {
+                    /* Skip files older than 30 days */
+                    if (sb.st_mtime < cutoff) continue;
                     /* Skip today's files — handled by scan_active_sessions */
                     if (is_modified_today(fullpath, st->today_str)) continue;
 
