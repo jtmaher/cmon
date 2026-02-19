@@ -28,6 +28,9 @@
 #define MAX_PATH_LEN      4096
 #define INOTIFY_BUF_SIZE  (sizeof(struct inotify_event) + NAME_MAX + 1) * 64
 #define TICK_MS           100
+#define MAX_DYNAMIC_PRICING 64
+#define PRICING_MAX_AGE  (24 * 60 * 60)
+#define PRICING_URL      "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 /* ── Cost per 1M tokens ───────────────────────────────────────── */
 typedef struct {
@@ -44,6 +47,14 @@ static const PricingTier PRICING[] = {
     {"claude-haiku-4",   0.80,  4.0,  0.08,    1.00},
     {NULL, 0, 0, 0, 0}
 };
+
+typedef struct {
+    char model[MAX_MODEL_NAME];
+    PricingTier tier;
+} DynamicPricingEntry;
+
+static DynamicPricingEntry g_dynamic_pricing[MAX_DYNAMIC_PRICING];
+static int g_dynamic_pricing_count = 0;
 
 /* ── Data Structures ──────────────────────────────────────────── */
 typedef struct {
@@ -141,6 +152,7 @@ static ModelTokens *find_or_add_model(ModelTokens *arr, int *count, int max, con
 static int find_request(CmonState *st, const char *rid);
 static void add_tracked_file(CmonState *st, const char *path);
 static void poll_files(CmonState *st);
+static void load_dynamic_pricing(void);
 
 /* ── Utility ──────────────────────────────────────────────────── */
 
@@ -161,9 +173,174 @@ static void format_tokens(long long tokens, char *buf, size_t bufsz) {
         snprintf(buf, bufsz, "%lld", tokens);
 }
 
+/* ── Dynamic Pricing ──────────────────────────────────────────── */
+
+static void ensure_cache_dir(const char *home) {
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/.cache", home);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/.cache/cmon", home);
+    mkdir(path, 0755);
+}
+
+static int is_cache_fresh(const char *path) {
+    struct stat sb;
+    if (stat(path, &sb) != 0) return 0;
+    return (time(NULL) - sb.st_mtime) < PRICING_MAX_AGE;
+}
+
+static char *read_file_to_string(const char *path, long *out_len) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 10 * 1024 * 1024) { fclose(f); return NULL; }
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t rd = fread(buf, 1, sz, f);
+    fclose(f);
+    buf[rd] = '\0';
+    if (out_len) *out_len = (long)rd;
+    return buf;
+}
+
+static int write_cache(const char *path, const char *data, long len) {
+    char tmp[MAX_PATH_LEN];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return -1;
+    size_t written = fwrite(data, 1, len, f);
+    fclose(f);
+    if ((long)written != len) { unlink(tmp); return -1; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
+static char *fetch_url_to_string(const char *url, long *out_len) {
+    char cmd[MAX_PATH_LEN];
+    snprintf(cmd, sizeof(cmd),
+             "curl -sL --max-time 10 --connect-timeout 5 '%s'", url);
+    FILE *p = popen(cmd, "r");
+    if (!p) return NULL;
+
+    size_t cap = 256 * 1024;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { pclose(p); return NULL; }
+
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len - 1, p)) > 0) {
+        len += n;
+        if (len + 1 >= cap) {
+            cap *= 2;
+            if (cap > 10 * 1024 * 1024) break;
+            char *tmp = realloc(buf, cap);
+            if (!tmp) break;
+            buf = tmp;
+        }
+    }
+    int status = pclose(p);
+    if (status != 0 || len == 0) { free(buf); return NULL; }
+    buf[len] = '\0';
+    if (out_len) *out_len = (long)len;
+    return buf;
+}
+
+static void parse_litellm_pricing(const char *json_str) {
+    cJSON *root = cJSON_Parse(json_str);
+    if (!root) return;
+
+    g_dynamic_pricing_count = 0;
+    cJSON *entry;
+    cJSON_ArrayForEach(entry, root) {
+        if (g_dynamic_pricing_count >= MAX_DYNAMIC_PRICING) break;
+        const char *key = entry->string;
+        if (!key) continue;
+        /* Only want top-level claude- models, skip provider-prefixed ones */
+        if (strncmp(key, "claude-", 7) != 0) continue;
+
+        if (!cJSON_IsObject(entry)) continue;
+        cJSON *inp = cJSON_GetObjectItem(entry, "input_cost_per_token");
+        cJSON *out = cJSON_GetObjectItem(entry, "output_cost_per_token");
+        if (!cJSON_IsNumber(inp) || !cJSON_IsNumber(out)) continue;
+
+        DynamicPricingEntry *dp = &g_dynamic_pricing[g_dynamic_pricing_count];
+        strncpy(dp->model, key, MAX_MODEL_NAME - 1);
+        dp->model[MAX_MODEL_NAME - 1] = '\0';
+        dp->tier.prefix = dp->model;
+        dp->tier.input = inp->valuedouble * 1e6;
+        dp->tier.output = out->valuedouble * 1e6;
+
+        cJSON *cr = cJSON_GetObjectItem(entry, "cache_read_input_token_cost");
+        dp->tier.cache_read = cJSON_IsNumber(cr) ? cr->valuedouble * 1e6 : dp->tier.input * 0.1;
+        cJSON *cw = cJSON_GetObjectItem(entry, "cache_creation_input_token_cost");
+        dp->tier.cache_write = cJSON_IsNumber(cw) ? cw->valuedouble * 1e6 : dp->tier.input * 1.25;
+
+        g_dynamic_pricing_count++;
+    }
+    cJSON_Delete(root);
+}
+
+static void load_dynamic_pricing(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+
+    ensure_cache_dir(home);
+
+    char cache_path[MAX_PATH_LEN];
+    snprintf(cache_path, sizeof(cache_path), "%s/.cache/cmon/pricing.json", home);
+
+    /* Try fresh cache first */
+    if (is_cache_fresh(cache_path)) {
+        long len = 0;
+        char *data = read_file_to_string(cache_path, &len);
+        if (data) {
+            parse_litellm_pricing(data);
+            free(data);
+            if (g_dynamic_pricing_count > 0) return;
+        }
+    }
+
+    /* Fetch from network */
+    long len = 0;
+    char *data = fetch_url_to_string(PRICING_URL, &len);
+    if (data) {
+        parse_litellm_pricing(data);
+        if (g_dynamic_pricing_count > 0) {
+            write_cache(cache_path, data, len);
+        }
+        free(data);
+        if (g_dynamic_pricing_count > 0) return;
+    }
+
+    /* Fall back to stale cache */
+    data = read_file_to_string(cache_path, &len);
+    if (data) {
+        parse_litellm_pricing(data);
+        free(data);
+    }
+    /* If still 0, hardcoded PRICING[] will be used as fallback */
+}
+
 static const PricingTier *find_pricing(const char *model) {
+    /* 1. Exact match in dynamic pricing */
+    for (int i = 0; i < g_dynamic_pricing_count; i++) {
+        if (strcmp(model, g_dynamic_pricing[i].model) == 0)
+            return &g_dynamic_pricing[i].tier;
+    }
+    /* 2. Longest-prefix match in dynamic pricing */
     const PricingTier *best = NULL;
     size_t best_len = 0;
+    for (int i = 0; i < g_dynamic_pricing_count; i++) {
+        size_t plen = strlen(g_dynamic_pricing[i].model);
+        if (strncmp(model, g_dynamic_pricing[i].model, plen) == 0 && plen > best_len) {
+            best = &g_dynamic_pricing[i].tier;
+            best_len = plen;
+        }
+    }
+    if (best) return best;
+    /* 3. Longest-prefix match in hardcoded pricing */
     for (int i = 0; PRICING[i].prefix; i++) {
         size_t plen = strlen(PRICING[i].prefix);
         if (strncmp(model, PRICING[i].prefix, plen) == 0 && plen > best_len) {
@@ -896,6 +1073,9 @@ int main(void) {
 
     CmonState st;
     init_state(&st);
+
+    /* 0. Load dynamic pricing (fetches once per 24h, best-effort) */
+    load_dynamic_pricing();
 
     /* 1. Parse historical data */
     parse_stats_cache(&st);
