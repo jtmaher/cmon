@@ -55,6 +55,7 @@ typedef struct {
 
 static DynamicPricingEntry g_dynamic_pricing[MAX_DYNAMIC_PRICING];
 static int g_dynamic_pricing_count = 0;
+static int g_lookback_days = 30;
 
 /* ── Data Structures ──────────────────────────────────────────── */
 typedef struct {
@@ -452,7 +453,7 @@ static void parse_stats_cache(CmonState *st) {
     /* Compute cutoff date string (30 days ago) for filtering */
     char cutoff_date[16];
     {
-        time_t cutoff = time(NULL) - 30 * 24 * 60 * 60;
+        time_t cutoff = time(NULL) - g_lookback_days * 24 * 60 * 60;
         struct tm *ct = localtime(&cutoff);
         strftime(cutoff_date, sizeof(cutoff_date), "%Y-%m-%d", ct);
     }
@@ -784,7 +785,7 @@ static void scan_historical_sessions(CmonState *st) {
         memset(st->daily[i].models, 0, sizeof(st->daily[i].models));
     }
 
-    time_t cutoff = time(NULL) - 30 * 24 * 60 * 60; /* 30 days ago */
+    time_t cutoff = time(NULL) - g_lookback_days * 24 * 60 * 60;
 
     char projects_dir[MAX_PATH_LEN];
     snprintf(projects_dir, sizeof(projects_dir), "%s/projects", st->claude_dir);
@@ -1319,8 +1320,22 @@ static void draw_screen(CmonState *st) {
 
 /* ── Main ─────────────────────────────────────────────────────── */
 
-int main(void) {
+int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
+
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--days") == 0) && i + 1 < argc) {
+            g_lookback_days = atoi(argv[++i]);
+            if (g_lookback_days < 1) g_lookback_days = 1;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: cmon [-d DAYS]\n");
+            printf("  -d, --days N   Number of days to look back (default: 30)\n");
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown option: %s\nUsage: cmon [-d DAYS]\n", argv[i]);
+            return 1;
+        }
+    }
 
     CmonState st;
     init_state(&st);
