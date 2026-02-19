@@ -23,7 +23,7 @@
 #define MAX_MODELS        32
 #define MAX_TRACKED_FILES 256
 #define MAX_DAILY         512
-#define MAX_REQUEST_IDS   4096
+#define MAX_REQUEST_IDS   32768
 #define MAX_MODEL_NAME    128
 #define MAX_PATH_LEN      4096
 #define INOTIFY_BUF_SIZE  (sizeof(struct inotify_event) + NAME_MAX + 1) * 64
@@ -71,6 +71,9 @@ typedef struct {
     int session_count;
     int tool_call_count;
     long long total_tokens;  /* from dailyModelTokens */
+    /* Per-model token breakdown (from JSONL parsing) */
+    ModelTokens models[MAX_MODELS];
+    int model_count;
 } DailyStats;
 
 typedef struct {
@@ -140,7 +143,10 @@ enum {
 static void init_state(CmonState *st);
 static void parse_stats_cache(CmonState *st);
 static void scan_active_sessions(CmonState *st);
-static void process_jsonl_line(CmonState *st, const char *line, const char *filepath);
+static void scan_historical_sessions(CmonState *st);
+static void process_jsonl_line(CmonState *st, const char *line,
+                               ModelTokens *models, int *model_count);
+static DailyStats *find_or_add_daily(CmonState *st, const char *date);
 static void tail_jsonl(CmonState *st, TrackedFile *tf);
 static void setup_inotify(CmonState *st);
 static void handle_inotify_events(CmonState *st);
@@ -506,8 +512,8 @@ static void parse_stats_cache(CmonState *st) {
 
 /* ── JSONL Processing ─────────────────────────────────────────── */
 
-static void process_jsonl_line(CmonState *st, const char *line, const char *filepath) {
-    (void)filepath;
+static void process_jsonl_line(CmonState *st, const char *line,
+                               ModelTokens *models, int *model_count) {
     /* Quick reject: only parse lines containing "type":"assistant" */
     if (!strstr(line, "\"type\":\"assistant\""))
         return;
@@ -547,8 +553,7 @@ static void process_jsonl_line(CmonState *st, const char *line, const char *file
     cJSON *rid_j = cJSON_GetObjectItem(root, "requestId");
     const char *rid = cJSON_IsString(rid_j) ? rid_j->valuestring : "";
 
-    ModelTokens *mt = find_or_add_model(st->today_models,
-        &st->today_model_count, MAX_MODELS, model);
+    ModelTokens *mt = find_or_add_model(models, model_count, MAX_MODELS, model);
     if (!mt) { cJSON_Delete(root); return; }
 
     if (rid[0] != '\0') {
@@ -610,7 +615,8 @@ static void tail_jsonl(CmonState *st, TrackedFile *tf) {
         size_t len = strlen(line);
         if (len > 0 && line[len - 1] == '\n') {
             line[len - 1] = '\0';
-            process_jsonl_line(st, line, tf->path);
+            process_jsonl_line(st, line,
+                               st->today_models, &st->today_model_count);
         }
     }
 
@@ -713,6 +719,107 @@ static void scan_active_sessions(CmonState *st) {
     }
 
     st->last_update = time(NULL);
+}
+
+static DailyStats *find_or_add_daily(CmonState *st, const char *date) {
+    for (int i = 0; i < st->daily_count; i++) {
+        if (strcmp(st->daily[i].date, date) == 0)
+            return &st->daily[i];
+    }
+    if (st->daily_count >= MAX_DAILY) return NULL;
+    DailyStats *ds = &st->daily[st->daily_count++];
+    memset(ds, 0, sizeof(*ds));
+    snprintf(ds->date, sizeof(ds->date), "%s", date);
+    return ds;
+}
+
+static void parse_jsonl_file(CmonState *st, const char *path,
+                             ModelTokens *models, int *model_count) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char *line = NULL;
+    size_t linesz = 0;
+    while (getline(&line, &linesz, f) > 0) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n') {
+            line[len - 1] = '\0';
+            process_jsonl_line(st, line, models, model_count);
+        }
+    }
+    free(line);
+    fclose(f);
+}
+
+static void scan_historical_sessions(CmonState *st) {
+    st->request_count = 0;
+    /* Reset all daily model data */
+    for (int i = 0; i < st->daily_count; i++) {
+        st->daily[i].model_count = 0;
+        memset(st->daily[i].models, 0, sizeof(st->daily[i].models));
+    }
+
+    char projects_dir[MAX_PATH_LEN];
+    snprintf(projects_dir, sizeof(projects_dir), "%s/projects", st->claude_dir);
+
+    DIR *pd = opendir(projects_dir);
+    if (!pd) return;
+
+    struct dirent *pent;
+    while ((pent = readdir(pd)) != NULL) {
+        if (pent->d_name[0] == '.') continue;
+        char projpath[MAX_PATH_LEN];
+        snprintf(projpath, sizeof(projpath), "%s/%s", projects_dir, pent->d_name);
+        struct stat psb;
+        if (stat(projpath, &psb) != 0 || !S_ISDIR(psb.st_mode)) continue;
+
+        /* Recursively find all .jsonl files in this project */
+        DIR *stack[16];
+        char dirpaths[16][MAX_PATH_LEN];
+        int depth = 0;
+        snprintf(dirpaths[0], MAX_PATH_LEN, "%s", projpath);
+        stack[0] = opendir(projpath);
+        if (!stack[0]) continue;
+
+        while (depth >= 0) {
+            struct dirent *ent = readdir(stack[depth]);
+            if (!ent) {
+                closedir(stack[depth]);
+                depth--;
+                continue;
+            }
+            if (ent->d_name[0] == '.') continue;
+
+            char fullpath[MAX_PATH_LEN];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpaths[depth], ent->d_name);
+
+            struct stat sb;
+            if (stat(fullpath, &sb) != 0) continue;
+
+            if (S_ISDIR(sb.st_mode) && depth < 15) {
+                depth++;
+                snprintf(dirpaths[depth], MAX_PATH_LEN, "%s", fullpath);
+                stack[depth] = opendir(fullpath);
+                if (!stack[depth]) { depth--; continue; }
+            } else if (S_ISREG(sb.st_mode)) {
+                size_t nlen = strlen(ent->d_name);
+                if (nlen > 6 && strcmp(ent->d_name + nlen - 6, ".jsonl") == 0) {
+                    /* Skip today's files — handled by scan_active_sessions */
+                    if (is_modified_today(fullpath, st->today_str)) continue;
+
+                    /* Determine date from file mtime */
+                    char date[16];
+                    struct tm *tm = localtime(&sb.st_mtime);
+                    strftime(date, sizeof(date), "%Y-%m-%d", tm);
+
+                    DailyStats *ds = find_or_add_daily(st, date);
+                    if (!ds) continue;
+
+                    parse_jsonl_file(st, fullpath, ds->models, &ds->model_count);
+                }
+            }
+        }
+    }
+    closedir(pd);
 }
 
 /* ── inotify ──────────────────────────────────────────────────── */
@@ -949,9 +1056,9 @@ static int draw_daily_history(CmonState *st, int row, int rows, int cols) {
         return row + 1;
     }
 
-    /* Column header */
+    /* Column header — same grid as TODAY / ALL TIME */
     attron(COLOR_PAIR(CP_DIM));
-    mvprintw(row, 4, "%-12s %6s %9s %7s %10s", "Date", "Msgs", "Sessions", "Tools", "Tokens");
+    mvprintw(row, 4, "%-24s %9s %9s %9s %9s %10s", "Date", "Input", "Output", "Cache.R", "Cache.W", "Cost");
     attroff(COLOR_PAIR(CP_DIM));
     row++;
 
@@ -968,17 +1075,45 @@ static int draw_daily_history(CmonState *st, int row, int rows, int cols) {
         int idx = st->daily_count - 1 - j - st->scroll_offset;
         if (idx < 0) break;
         DailyStats *ds = &st->daily[idx];
-        char tok_s[16];
-        format_tokens(ds->total_tokens, tok_s, sizeof(tok_s));
-
         int is_today = (strcmp(ds->date, st->today_str) == 0);
+
+        /* For today, use live data; for historical, use JSONL-derived daily data */
+        ModelTokens *src = is_today ? st->today_models : ds->models;
+        int src_count = is_today ? st->today_model_count : ds->model_count;
+
+        long long tot_in = 0, tot_out = 0, tot_cr = 0, tot_cw = 0;
+        double cost = 0;
+        for (int k = 0; k < src_count; k++) {
+            tot_in  += src[k].input_tokens;
+            tot_out += src[k].output_tokens;
+            tot_cr  += src[k].cache_read;
+            tot_cw  += src[k].cache_write;
+            cost    += compute_cost(&src[k]);
+        }
+
+        char in_s[16], out_s[16], cr_s[16], cw_s[16];
+        format_tokens(tot_in, in_s, sizeof(in_s));
+        format_tokens(tot_out, out_s, sizeof(out_s));
+        format_tokens(tot_cr, cr_s, sizeof(cr_s));
+        format_tokens(tot_cw, cw_s, sizeof(cw_s));
+
+        /* Date column */
         if (is_today) attron(COLOR_PAIR(CP_VALUE) | A_BOLD);
-
-        mvprintw(row, 4, "%-12s %6d %9d %7d %10s",
-                 ds->date, ds->message_count, ds->session_count,
-                 ds->tool_call_count, tok_s);
-
+        mvprintw(row, 4, "%-24s", ds->date);
         if (is_today) attroff(COLOR_PAIR(CP_VALUE) | A_BOLD);
+
+        /* Token columns */
+        attron(COLOR_PAIR(CP_VALUE) | (is_today ? A_BOLD : 0));
+        mvprintw(row, 28, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
+        attroff(COLOR_PAIR(CP_VALUE) | (is_today ? A_BOLD : 0));
+
+        /* Cost column */
+        if (src_count > 0) {
+            attron(COLOR_PAIR(CP_COST) | (is_today ? A_BOLD : 0));
+            mvprintw(row, 68, " $%7.2f", cost);
+            attroff(COLOR_PAIR(CP_COST) | (is_today ? A_BOLD : 0));
+        }
+
         row++;
     }
 
@@ -995,9 +1130,48 @@ static int draw_alltime(CmonState *st, int row, int cols) {
     attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
     row++;
 
+    /* Build aggregated per-model totals from all daily JSONL data + today */
+    ModelTokens agg[MAX_MODELS];
+    int agg_count = 0;
+    memset(agg, 0, sizeof(agg));
+
+    /* Sum all historical daily entries */
+    for (int d = 0; d < st->daily_count; d++) {
+        DailyStats *ds = &st->daily[d];
+        int is_today = (strcmp(ds->date, st->today_str) == 0);
+        if (is_today) continue; /* today added separately from live data */
+        for (int m = 0; m < ds->model_count; m++) {
+            ModelTokens *src = &ds->models[m];
+            ModelTokens *dst = find_or_add_model(agg, &agg_count, MAX_MODELS, src->model);
+            if (!dst) continue;
+            dst->input_tokens += src->input_tokens;
+            dst->output_tokens += src->output_tokens;
+            dst->cache_read += src->cache_read;
+            dst->cache_write += src->cache_write;
+        }
+    }
+
+    /* Add today's live data */
+    for (int i = 0; i < st->today_model_count; i++) {
+        ModelTokens *src = &st->today_models[i];
+        ModelTokens *dst = find_or_add_model(agg, &agg_count, MAX_MODELS, src->model);
+        if (!dst) continue;
+        dst->input_tokens += src->input_tokens;
+        dst->output_tokens += src->output_tokens;
+        dst->cache_read += src->cache_read;
+        dst->cache_write += src->cache_write;
+    }
+
+    /* Column header (same as TODAY) */
+    attron(COLOR_PAIR(CP_DIM));
+    mvprintw(row, 4, "%-24s %9s %9s %9s %9s %10s", "Model", "Input", "Output", "Cache.R", "Cache.W", "Cost");
+    attroff(COLOR_PAIR(CP_DIM));
+    row++;
+
+    long long tot_in = 0, tot_out = 0, tot_cr = 0, tot_cw = 0;
     double total_cost = 0;
-    for (int i = 0; i < st->alltime_model_count; i++) {
-        ModelTokens *mt = &st->alltime_models[i];
+    for (int i = 0; i < agg_count; i++) {
+        ModelTokens *mt = &agg[i];
         char in_s[16], out_s[16], cr_s[16], cw_s[16];
         format_tokens(mt->input_tokens, in_s, sizeof(in_s));
         format_tokens(mt->output_tokens, out_s, sizeof(out_s));
@@ -1007,21 +1181,40 @@ static int draw_alltime(CmonState *st, int row, int cols) {
         total_cost += cost;
 
         attron(COLOR_PAIR(CP_MODEL));
-        mvprintw(row, 4, "%-22s", mt->model);
+        mvprintw(row, 4, "%-24s", mt->model);
         attroff(COLOR_PAIR(CP_MODEL));
         attron(COLOR_PAIR(CP_VALUE));
-        mvprintw(row, 26, "In %-6s Out %-6s CR %-6s CW %-6s", in_s, out_s, cr_s, cw_s);
+        mvprintw(row, 28, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
         attroff(COLOR_PAIR(CP_VALUE));
         attron(COLOR_PAIR(CP_COST) | A_BOLD);
-        mvprintw(row, cols - 10, "$%8.2f", cost);
+        mvprintw(row, 68, " $%7.2f", cost);
+        attroff(COLOR_PAIR(CP_COST) | A_BOLD);
+        row++;
+
+        tot_in += mt->input_tokens;
+        tot_out += mt->output_tokens;
+        tot_cr += mt->cache_read;
+        tot_cw += mt->cache_write;
+    }
+
+    {
+        char in_s[16], out_s[16], cr_s[16], cw_s[16];
+        format_tokens(tot_in, in_s, sizeof(in_s));
+        format_tokens(tot_out, out_s, sizeof(out_s));
+        format_tokens(tot_cr, cr_s, sizeof(cr_s));
+        format_tokens(tot_cw, cw_s, sizeof(cw_s));
+
+        attron(COLOR_PAIR(CP_LABEL) | A_BOLD);
+        mvprintw(row, 4, "%-24s", "TOTAL");
+        attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
+        attron(COLOR_PAIR(CP_VALUE) | A_BOLD);
+        mvprintw(row, 28, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
+        attroff(COLOR_PAIR(CP_VALUE) | A_BOLD);
+        attron(COLOR_PAIR(CP_COST) | A_BOLD);
+        mvprintw(row, 68, " $%7.2f", total_cost);
         attroff(COLOR_PAIR(CP_COST) | A_BOLD);
         row++;
     }
-
-    attron(COLOR_PAIR(CP_COST) | A_BOLD);
-    mvprintw(row, 4, "Total Estimated Cost: $%.2f", total_cost);
-    attroff(COLOR_PAIR(CP_COST) | A_BOLD);
-    row++;
 
     return row;
 }
@@ -1080,10 +1273,13 @@ int main(void) {
     /* 1. Parse historical data */
     parse_stats_cache(&st);
 
-    /* 2. Set up inotify before scanning (so new files get watched) */
+    /* 2. Scan historical JSONL files for per-day token breakdowns */
+    scan_historical_sessions(&st);
+
+    /* 3. Set up inotify before scanning (so new files get watched) */
     setup_inotify(&st);
 
-    /* 3. Scan today's JSONL files */
+    /* 4. Scan today's JSONL files */
     scan_active_sessions(&st);
 
     /* 4. Init ncurses */
@@ -1133,8 +1329,9 @@ int main(void) {
                 st.scroll_offset--;
             break;
         case 'r':
-            scan_active_sessions(&st);
             parse_stats_cache(&st);
+            scan_historical_sessions(&st);
+            scan_active_sessions(&st);
             break;
         }
 
