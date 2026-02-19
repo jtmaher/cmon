@@ -161,6 +161,7 @@ static void add_tracked_file(CmonState *st, const char *path);
 static void poll_files(CmonState *st);
 static void load_dynamic_pricing(void);
 static int cmp_model_cost_desc(const void *a, const void *b);
+static int cmp_daily_date_desc(const void *a, const void *b);
 
 /* ── Utility ──────────────────────────────────────────────────── */
 
@@ -374,6 +375,10 @@ static int cmp_model_cost_desc(const void *a, const void *b) {
     if (cb > ca) return 1;
     if (cb < ca) return -1;
     return 0;
+}
+
+static int cmp_daily_date_desc(const void *a, const void *b) {
+    return strcmp(((const DailyStats *)b)->date, ((const DailyStats *)a)->date);
 }
 
 static ModelTokens *find_or_add_model(ModelTokens *arr, int *count, int max, const char *model) {
@@ -1095,8 +1100,8 @@ static int draw_daily_history(CmonState *st, int row, int rows, int cols) {
         st->scroll_offset = st->max_scroll;
 
     for (int j = 0; j < avail_rows && row < rows - 8; j++) {
-        int idx = st->daily_count - 1 - j - st->scroll_offset;
-        if (idx < 0) break;
+        int idx = j + st->scroll_offset;
+        if (idx >= st->daily_count) break;
         DailyStats *ds = &st->daily[idx];
         int is_today = (strcmp(ds->date, st->today_str) == 0);
 
@@ -1315,6 +1320,7 @@ int main(void) {
 
     /* 2. Scan historical JSONL files for per-day token breakdowns */
     scan_historical_sessions(&st);
+    qsort(st.daily, st.daily_count, sizeof(DailyStats), cmp_daily_date_desc);
 
     /* 3. Set up inotify before scanning (so new files get watched) */
     setup_inotify(&st);
@@ -1371,6 +1377,7 @@ int main(void) {
         case 'r':
             parse_stats_cache(&st);
             scan_historical_sessions(&st);
+            qsort(st.daily, st.daily_count, sizeof(DailyStats), cmp_daily_date_desc);
             scan_active_sessions(&st);
             break;
         }
