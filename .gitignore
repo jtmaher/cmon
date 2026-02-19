@@ -1,0 +1,7 @@
+# Build artifacts
+*.o
+cmon
+deps/
+
+# Claude Code
+.claude/
