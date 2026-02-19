@@ -59,6 +59,7 @@ static int g_dynamic_pricing_count = 0;
 /* ── Data Structures ──────────────────────────────────────────── */
 typedef struct {
     char model[MAX_MODEL_NAME];
+    int messages;
     long long input_tokens;
     long long output_tokens;
     long long cache_read;
@@ -159,6 +160,7 @@ static int find_request(CmonState *st, const char *rid);
 static void add_tracked_file(CmonState *st, const char *path);
 static void poll_files(CmonState *st);
 static void load_dynamic_pricing(void);
+static int cmp_model_cost_desc(const void *a, const void *b);
 
 /* ── Utility ──────────────────────────────────────────────────── */
 
@@ -366,6 +368,14 @@ static double compute_cost(const ModelTokens *mt) {
             mt->cache_write * p->cache_write) / 1e6;
 }
 
+static int cmp_model_cost_desc(const void *a, const void *b) {
+    double ca = compute_cost((const ModelTokens *)a);
+    double cb = compute_cost((const ModelTokens *)b);
+    if (cb > ca) return 1;
+    if (cb < ca) return -1;
+    return 0;
+}
+
 static ModelTokens *find_or_add_model(ModelTokens *arr, int *count, int max, const char *model) {
     for (int i = 0; i < *count; i++) {
         if (strcmp(arr[i].model, model) == 0)
@@ -568,6 +578,7 @@ static void process_jsonl_line(CmonState *st, const char *line,
             /* input/cache already counted, skip */
         } else {
             /* New requestId — count everything */
+            mt->messages++;
             mt->input_tokens += in_tok;
             mt->output_tokens += out_tok;
             mt->cache_read += cache_r;
@@ -580,6 +591,7 @@ static void process_jsonl_line(CmonState *st, const char *line,
         }
     } else {
         /* No requestId — just add directly */
+        mt->messages++;
         mt->input_tokens += in_tok;
         mt->output_tokens += out_tok;
         mt->cache_read += cache_r;
@@ -981,15 +993,20 @@ static int draw_today(CmonState *st, int row, int cols) {
 
     /* Column header */
     attron(COLOR_PAIR(CP_DIM));
-    mvprintw(row, 4, "%-24s %9s %9s %9s %9s %10s", "Model", "Input", "Output", "Cache.R", "Cache.W", "Cost");
+    mvprintw(row, 4, "%-24s %5s %9s %9s %9s %9s %10s", "Model", "Msgs", "Input", "Output", "Cache.R", "Cache.W", "Cost");
     attroff(COLOR_PAIR(CP_DIM));
     row++;
 
+    qsort(st->today_models, st->today_model_count, sizeof(ModelTokens), cmp_model_cost_desc);
+
     long long tot_in = 0, tot_out = 0, tot_cr = 0, tot_cw = 0;
+    int tot_msgs = 0;
     double tot_cost = 0;
 
     for (int i = 0; i < st->today_model_count; i++) {
         ModelTokens *mt = &st->today_models[i];
+        if (mt->input_tokens == 0 && mt->output_tokens == 0 &&
+            mt->cache_read == 0 && mt->cache_write == 0) continue;
         char in_s[16], out_s[16], cr_s[16], cw_s[16];
         format_tokens(mt->input_tokens, in_s, sizeof(in_s));
         format_tokens(mt->output_tokens, out_s, sizeof(out_s));
@@ -1000,11 +1017,14 @@ static int draw_today(CmonState *st, int row, int cols) {
         attron(COLOR_PAIR(CP_MODEL));
         mvprintw(row, 4, "%-24s", mt->model);
         attroff(COLOR_PAIR(CP_MODEL));
+        attron(COLOR_PAIR(CP_VALUE));
+        mvprintw(row, 28, " %5d", mt->messages);
+        attroff(COLOR_PAIR(CP_VALUE));
         attron(COLOR_PAIR(CP_VALUE) | A_BOLD);
-        mvprintw(row, 28, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
+        mvprintw(row, 34, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
         attroff(COLOR_PAIR(CP_VALUE) | A_BOLD);
         attron(COLOR_PAIR(CP_COST) | A_BOLD);
-        mvprintw(row, 68, " $%7.2f", cost);
+        mvprintw(row, 74, " $%7.2f", cost);
         attroff(COLOR_PAIR(CP_COST) | A_BOLD);
         row++;
 
@@ -1012,6 +1032,7 @@ static int draw_today(CmonState *st, int row, int cols) {
         tot_out += mt->output_tokens;
         tot_cr += mt->cache_read;
         tot_cw += mt->cache_write;
+        tot_msgs += mt->messages;
         tot_cost += cost;
     }
 
@@ -1026,10 +1047,11 @@ static int draw_today(CmonState *st, int row, int cols) {
         mvprintw(row, 4, "%-24s", "TOTAL");
         attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
         attron(COLOR_PAIR(CP_VALUE) | A_BOLD);
-        mvprintw(row, 28, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
+        mvprintw(row, 28, " %5d", tot_msgs);
+        mvprintw(row, 34, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
         attroff(COLOR_PAIR(CP_VALUE) | A_BOLD);
         attron(COLOR_PAIR(CP_COST) | A_BOLD);
-        mvprintw(row, 68, " $%7.2f", tot_cost);
+        mvprintw(row, 74, " $%7.2f", tot_cost);
         attroff(COLOR_PAIR(CP_COST) | A_BOLD);
         row++;
     }
@@ -1058,7 +1080,7 @@ static int draw_daily_history(CmonState *st, int row, int rows, int cols) {
 
     /* Column header — same grid as TODAY / ALL TIME */
     attron(COLOR_PAIR(CP_DIM));
-    mvprintw(row, 4, "%-24s %9s %9s %9s %9s %10s", "Date", "Input", "Output", "Cache.R", "Cache.W", "Cost");
+    mvprintw(row, 4, "%-24s %5s %9s %9s %9s %9s %10s", "Date", "Msgs", "Input", "Output", "Cache.R", "Cache.W", "Cost");
     attroff(COLOR_PAIR(CP_DIM));
     row++;
 
@@ -1082,12 +1104,14 @@ static int draw_daily_history(CmonState *st, int row, int rows, int cols) {
         int src_count = is_today ? st->today_model_count : ds->model_count;
 
         long long tot_in = 0, tot_out = 0, tot_cr = 0, tot_cw = 0;
+        int tot_msgs = 0;
         double cost = 0;
         for (int k = 0; k < src_count; k++) {
             tot_in  += src[k].input_tokens;
             tot_out += src[k].output_tokens;
             tot_cr  += src[k].cache_read;
             tot_cw  += src[k].cache_write;
+            tot_msgs += src[k].messages;
             cost    += compute_cost(&src[k]);
         }
 
@@ -1102,15 +1126,20 @@ static int draw_daily_history(CmonState *st, int row, int rows, int cols) {
         mvprintw(row, 4, "%-24s", ds->date);
         if (is_today) attroff(COLOR_PAIR(CP_VALUE) | A_BOLD);
 
+        /* Msgs column */
+        attron(COLOR_PAIR(CP_VALUE) | (is_today ? A_BOLD : 0));
+        mvprintw(row, 28, " %5d", tot_msgs);
+        attroff(COLOR_PAIR(CP_VALUE) | (is_today ? A_BOLD : 0));
+
         /* Token columns */
         attron(COLOR_PAIR(CP_VALUE) | (is_today ? A_BOLD : 0));
-        mvprintw(row, 28, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
+        mvprintw(row, 34, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
         attroff(COLOR_PAIR(CP_VALUE) | (is_today ? A_BOLD : 0));
 
         /* Cost column */
         if (src_count > 0) {
             attron(COLOR_PAIR(CP_COST) | (is_today ? A_BOLD : 0));
-            mvprintw(row, 68, " $%7.2f", cost);
+            mvprintw(row, 74, " $%7.2f", cost);
             attroff(COLOR_PAIR(CP_COST) | (is_today ? A_BOLD : 0));
         }
 
@@ -1144,6 +1173,7 @@ static int draw_alltime(CmonState *st, int row, int cols) {
             ModelTokens *src = &ds->models[m];
             ModelTokens *dst = find_or_add_model(agg, &agg_count, MAX_MODELS, src->model);
             if (!dst) continue;
+            dst->messages += src->messages;
             dst->input_tokens += src->input_tokens;
             dst->output_tokens += src->output_tokens;
             dst->cache_read += src->cache_read;
@@ -1156,6 +1186,7 @@ static int draw_alltime(CmonState *st, int row, int cols) {
         ModelTokens *src = &st->today_models[i];
         ModelTokens *dst = find_or_add_model(agg, &agg_count, MAX_MODELS, src->model);
         if (!dst) continue;
+        dst->messages += src->messages;
         dst->input_tokens += src->input_tokens;
         dst->output_tokens += src->output_tokens;
         dst->cache_read += src->cache_read;
@@ -1164,14 +1195,19 @@ static int draw_alltime(CmonState *st, int row, int cols) {
 
     /* Column header (same as TODAY) */
     attron(COLOR_PAIR(CP_DIM));
-    mvprintw(row, 4, "%-24s %9s %9s %9s %9s %10s", "Model", "Input", "Output", "Cache.R", "Cache.W", "Cost");
+    mvprintw(row, 4, "%-24s %5s %9s %9s %9s %9s %10s", "Model", "Msgs", "Input", "Output", "Cache.R", "Cache.W", "Cost");
     attroff(COLOR_PAIR(CP_DIM));
     row++;
 
+    qsort(agg, agg_count, sizeof(ModelTokens), cmp_model_cost_desc);
+
     long long tot_in = 0, tot_out = 0, tot_cr = 0, tot_cw = 0;
+    int tot_msgs = 0;
     double total_cost = 0;
     for (int i = 0; i < agg_count; i++) {
         ModelTokens *mt = &agg[i];
+        if (mt->input_tokens == 0 && mt->output_tokens == 0 &&
+            mt->cache_read == 0 && mt->cache_write == 0) continue;
         char in_s[16], out_s[16], cr_s[16], cw_s[16];
         format_tokens(mt->input_tokens, in_s, sizeof(in_s));
         format_tokens(mt->output_tokens, out_s, sizeof(out_s));
@@ -1184,10 +1220,11 @@ static int draw_alltime(CmonState *st, int row, int cols) {
         mvprintw(row, 4, "%-24s", mt->model);
         attroff(COLOR_PAIR(CP_MODEL));
         attron(COLOR_PAIR(CP_VALUE));
-        mvprintw(row, 28, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
+        mvprintw(row, 28, " %5d", mt->messages);
+        mvprintw(row, 34, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
         attroff(COLOR_PAIR(CP_VALUE));
         attron(COLOR_PAIR(CP_COST) | A_BOLD);
-        mvprintw(row, 68, " $%7.2f", cost);
+        mvprintw(row, 74, " $%7.2f", cost);
         attroff(COLOR_PAIR(CP_COST) | A_BOLD);
         row++;
 
@@ -1195,6 +1232,7 @@ static int draw_alltime(CmonState *st, int row, int cols) {
         tot_out += mt->output_tokens;
         tot_cr += mt->cache_read;
         tot_cw += mt->cache_write;
+        tot_msgs += mt->messages;
     }
 
     {
@@ -1208,10 +1246,11 @@ static int draw_alltime(CmonState *st, int row, int cols) {
         mvprintw(row, 4, "%-24s", "TOTAL");
         attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
         attron(COLOR_PAIR(CP_VALUE) | A_BOLD);
-        mvprintw(row, 28, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
+        mvprintw(row, 28, " %5d", tot_msgs);
+        mvprintw(row, 34, " %9s %9s %9s %9s", in_s, out_s, cr_s, cw_s);
         attroff(COLOR_PAIR(CP_VALUE) | A_BOLD);
         attron(COLOR_PAIR(CP_COST) | A_BOLD);
-        mvprintw(row, 68, " $%7.2f", total_cost);
+        mvprintw(row, 74, " $%7.2f", total_cost);
         attroff(COLOR_PAIR(CP_COST) | A_BOLD);
         row++;
     }
