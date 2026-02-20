@@ -29,6 +29,8 @@
 #define INOTIFY_BUF_SIZE  (sizeof(struct inotify_event) + NAME_MAX + 1) * 64
 #define TICK_MS           100
 #define MAX_DYNAMIC_PRICING 64
+#define HIST_BUCKETS      120  /* 120 x 30s = 60 minutes */
+#define HIST_BUCKET_SECS  30
 #define PRICING_MAX_AGE  (24 * 60 * 60)
 #define PRICING_URL      "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
@@ -127,6 +129,12 @@ typedef struct {
     /* inotify fallback */
     int use_polling;
     time_t last_poll;
+
+    /* Rolling cost histogram (last 15 min) */
+    double hist_cost[HIST_BUCKETS];  /* cost accumulated per bucket */
+    int hist_head;                   /* current bucket index */
+    time_t hist_bucket_start;        /* when current bucket started */
+    double hist_prev_cost;           /* total cost at last sample */
 } CmonState;
 
 /* ── Color pairs ──────────────────────────────────────────────── */
@@ -1104,7 +1112,7 @@ static int draw_daily_history(CmonState *st, int row, int rows, int cols) {
     row++;
 
     /* Show daily stats in reverse chronological order */
-    int avail_rows = rows - row - 8; /* leave room for alltime + status */
+    int avail_rows = rows - row - 13; /* leave room for alltime + histogram (2-row) + status */
     if (avail_rows < 3) avail_rows = 3;
     if (avail_rows > 10) avail_rows = 10;
 
@@ -1278,6 +1286,114 @@ static int draw_alltime(CmonState *st, int row, int cols) {
     return row;
 }
 
+static double compute_today_cost(CmonState *st) {
+    double total = 0;
+    for (int i = 0; i < st->today_model_count; i++)
+        total += compute_cost(&st->today_models[i]);
+    return total;
+}
+
+static void hist_update(CmonState *st) {
+    time_t now = time(NULL);
+
+    /* Initialize on first call */
+    if (st->hist_bucket_start == 0) {
+        st->hist_bucket_start = now;
+        st->hist_prev_cost = compute_today_cost(st);
+        return;
+    }
+
+    /* Accumulate cost delta into current bucket */
+    double cur_cost = compute_today_cost(st);
+    double delta = cur_cost - st->hist_prev_cost;
+    if (delta > 0)
+        st->hist_cost[st->hist_head] += delta;
+    st->hist_prev_cost = cur_cost;
+
+    /* Rotate bucket if time elapsed */
+    while (now - st->hist_bucket_start >= HIST_BUCKET_SECS) {
+        st->hist_bucket_start += HIST_BUCKET_SECS;
+        st->hist_head = (st->hist_head + 1) % HIST_BUCKETS;
+        st->hist_cost[st->hist_head] = 0;
+    }
+}
+
+static int draw_histogram(CmonState *st, int row, int rows, int cols) {
+    /* Need: hline + 2 bar rows + 1 axis row, plus 2 for status below */
+    if (row >= rows - 6) return row;
+
+    draw_hline(row, cols);
+    row++;
+
+    /* Find max value for scaling */
+    double max_val = 0;
+    for (int i = 0; i < HIST_BUCKETS; i++) {
+        if (st->hist_cost[i] > max_val)
+            max_val = st->hist_cost[i];
+    }
+
+    static const char *blocks[] = {" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+    int label_len = 10; /* "$/30s " */
+    int suffix_len = 12; /* " $XX.XX peak" */
+    int bar_width = cols - label_len - suffix_len;
+    if (bar_width > HIST_BUCKETS) bar_width = HIST_BUCKETS;
+    if (bar_width < 10) bar_width = 10;
+    int start_col = label_len;
+
+    /* Label on top bar row */
+    attron(COLOR_PAIR(CP_LABEL) | A_BOLD);
+    mvprintw(row, 2, "$/30s");
+    attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
+
+    /* Draw 2-row bar chart: 16 levels (8 per row), oldest left, newest right */
+    /* Top row: levels 9-16, Bottom row: levels 1-8 */
+    for (int r = 0; r < 2; r++) {
+        attron(COLOR_PAIR(CP_COST));
+        for (int i = 0; i < bar_width; i++) {
+            int bucket_offset = bar_width - 1 - i;
+            int bi = (st->hist_head - bucket_offset + HIST_BUCKETS) % HIST_BUCKETS;
+            double val = st->hist_cost[bi];
+
+            if (val <= 0 || max_val <= 0) {
+                mvprintw(row + r, start_col + i, " ");
+            } else {
+                /* 0..15 across 2 rows: top row = upper 8, bottom row = lower 8 */
+                int level = (int)(val / max_val * 15.99);
+                if (level > 15) level = 15;
+                int cell;
+                if (r == 0) {
+                    /* Top row: show block only if level > 7 */
+                    cell = level > 7 ? level - 7 : 0;
+                } else {
+                    /* Bottom row: full block if level > 7, partial otherwise */
+                    cell = level > 7 ? 8 : level;
+                }
+                mvprintw(row + r, start_col + i, "%s", blocks[cell]);
+            }
+        }
+        attroff(COLOR_PAIR(CP_COST));
+    }
+
+    /* Peak value on top row */
+    if (max_val > 0) {
+        attron(COLOR_PAIR(CP_DIM));
+        mvprintw(row, start_col + bar_width + 1, "$%.2f pk", max_val);
+        attroff(COLOR_PAIR(CP_DIM));
+    }
+    row += 2;
+
+    /* Time axis */
+    attron(COLOR_PAIR(CP_DIM));
+    mvprintw(row, start_col, "-60m");
+    int now_col = start_col + bar_width - 3;
+    if (now_col > start_col + 5)
+        mvprintw(row, now_col, "now");
+    attroff(COLOR_PAIR(CP_DIM));
+    row++;
+
+    return row;
+}
+
 static void draw_status(CmonState *st, int rows, int cols) {
     int row = rows - 1;
     draw_hline(row - 1, cols);
@@ -1312,6 +1428,7 @@ static void draw_screen(CmonState *st) {
     int row = draw_today(st, 1, cols);
     row = draw_daily_history(st, row, rows, cols);
     row = draw_alltime(st, row, cols);
+    row = draw_histogram(st, row, rows, cols);
     (void)row;
     draw_status(st, rows, cols);
 
@@ -1381,6 +1498,9 @@ int main(int argc, char *argv[]) {
     while (st.running) {
         /* Handle inotify/polling */
         handle_inotify_events(&st);
+
+        /* Update cost histogram */
+        hist_update(&st);
 
         /* Draw */
         draw_screen(&st);
